@@ -41,7 +41,7 @@
 
 ### 1. 解压 Boost
 
-- `boost_1_83_0.tar.gz` 放在 [https://github.com/PassByYou888/zIPC/releases](https://github.com/PassByYou888/zIPC/releases)
+- `boost_1_83_0.tar.gz` 放在 [https://github.com/PassByYou888/zIPC/releases/download/boost_1_83_0.tar.gz/boost_1_83_0.tar.gz](https://github.com/PassByYou888/zIPC/releases/download/boost_1_83_0.tar.gz/boost_1_83_0.tar.gz)
 - 将 `boost_1_83_0.tar.gz` 放在项目source目录（与 `build_on_linux.sh` 同级），脚本会自动解压。
 
 ### 2. 赋予脚本执行权限
@@ -145,6 +145,7 @@ cd build && make test
 ## 🔗 相关链接
 
 - [项目 README](./readme.md)
+- [zAPI项目](https://github.com/PassByYou888/zAPI)
 - [Boost 官网](https://www.boost.org/)
 - [CMake 文档](https://cmake.org/documentation/)
 
