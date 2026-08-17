@@ -29,12 +29,13 @@
 #include <thread>
 #include <vector>
 #include <sstream>
+#include <cstring>   // for strlen
 
  /* Global status handler pointer 每 initially null.
   * It is set by ipc_Set_Status_handler and called by IPC_streambuf.
   * Used to forward library log output to the user's callback.
   */
-    static status_handler status_call_Handler = 0;
+static status_handler status_call_Handler = 0;
 
 /**
  * Custom streambuf class that redirects std::cout/std::cerr output to the
@@ -129,25 +130,23 @@ extern "C" {
      * @return Server handle (non-zero) on success, 0 on failure.
      *
      * This is a convenience wrapper around ipc_server_create_ex.
-     * It fills a default config (max_queue=1000, max_msg=1024) and calls the extended version.
+     * It uses default values: max_queue_length=1000, max_msg_size=1024.
      */
     ipc_server_handle_t ipc_server_create(const char* queue_name, int thread_count) {
-        ipc_server_config_t cfg;
-        cfg.thread_count = thread_count;
-        cfg.max_queue_length = 1000;
-        cfg.max_msg_size = 1024;
-        return ipc_server_create_ex(queue_name, &cfg);
+        return ipc_server_create_ex(queue_name, thread_count, 1000, 1024);
     }
 
     /**
-     * ipc_server_create_ex 每 Create a server with explicit configuration.
-     * @param queue_name   Name of the main queue.
-     * @param cfg          Pointer to configuration structure; if NULL, defaults are used.
+     * ipc_server_create_ex 每 Create a server with explicit parameters.
+     * @param queue_name        Name of the main queue.
+     * @param thread_count      Number of worker threads (0 = auto).
+     * @param max_queue_length  Maximum number of pending messages.
+     * @param max_msg_size      Maximum size of control messages.
      * @return Server handle (non-zero) on success, 0 on failure.
      *
      * Flow:
      * 1. Validate queue_name.
-     * 2. Copy config and sanitize values (ensure minimums).
+     * 2. Sanitize parameters (ensure reasonable values).
      * 3. Instantiate IpcServer and call start().
      * 4. If start succeeds, allocate a new handle and store the shared_ptr in g_servers.
      * 5. Return the handle.
@@ -156,35 +155,70 @@ extern "C" {
      * The server is not running until start() returns true.
      */
     ipc_server_handle_t ipc_server_create_ex(const char* queue_name,
-        const ipc_server_config_t* cfg) {
+        int thread_count, size_t max_queue_length, size_t max_msg_size) {
         if (!queue_name) {
             ZIPC_LOG("ipc_server_create_ex: queue_name is null");
             return 0;
         }
-        ipc_server_config_t config;
-        if (cfg) config = *cfg;
-        else {
-            config.thread_count = 0;
-            config.max_queue_length = 1000;
-            config.max_msg_size = 1024;
+        size_t name_len = strlen(queue_name);
+        ZIPC_LOG("ipc_server_create_ex: queue_name='" << queue_name
+            << "', length=" << name_len
+            << ", thread_count=" << thread_count
+            << ", max_queue_length=" << max_queue_length
+            << ", max_msg_size=" << max_msg_size);
+
+        // ---- Sanitize parameters ----
+        if (max_queue_length == 0) {
+            ZIPC_LOG("ipc_server_create_ex: max_queue_length was 0, setting to 1000");
+            max_queue_length = 1000;
         }
-        // Protect against invalid values.
-        if (config.max_queue_length == 0) config.max_queue_length = 1000;
-        if (config.max_msg_size < 64) config.max_msg_size = 1024;
-        if (config.thread_count < 0) config.thread_count = 0;
+        if (max_msg_size < 64) {
+            ZIPC_LOG("ipc_server_create_ex: max_msg_size was " << max_msg_size << ", setting to 1024");
+            max_msg_size = 1024;
+        }
+        if (thread_count < 0) {
+            ZIPC_LOG("ipc_server_create_ex: thread_count was negative, setting to 0");
+            thread_count = 0;
+        }
+
+        // ---- Defensive correction for extremely large values (e.g., uninitialized memory) ----
+        if (max_queue_length > 1000000) {
+            ZIPC_LOG("ipc_server_create_ex: WARNING: max_queue_length=" << max_queue_length
+                << " too large, reset to 1000");
+            max_queue_length = 1000;
+        }
+        if (max_msg_size > 65536) {
+            ZIPC_LOG("ipc_server_create_ex: WARNING: max_msg_size=" << max_msg_size
+                << " too large, reset to 1024");
+            max_msg_size = 1024;
+        }
+        if (thread_count > 100) {
+            ZIPC_LOG("ipc_server_create_ex: WARNING: thread_count=" << thread_count
+                << " too large, reset to 0 (auto)");
+            thread_count = 0;
+        }
+        // Re-check for zero after possible reset
+        if (max_queue_length == 0) max_queue_length = 1000;
+        if (max_msg_size == 0) max_msg_size = 1024;
+        // ---- End defensive correction ----
 
         auto server = std::make_shared<IpcServer>();
-        if (!server->start(queue_name, config.thread_count,
-            config.max_queue_length, config.max_msg_size)) {
-            ZIPC_LOG("ipc_server_create_ex: server start failed for queue '" << queue_name << "'");
+        ZIPC_LOG("ipc_server_create_ex: calling server->start with queue='" << queue_name
+            << "', thread_count=" << thread_count
+            << ", max_queue_length=" << max_queue_length
+            << ", max_msg_size=" << max_msg_size);
+
+        if (!server->start(queue_name, thread_count, max_queue_length, max_msg_size)) {
+            ZIPC_LOG("ipc_server_create_ex: server start failed for queue '" << queue_name
+                << "' (see server log for details)");
             return 0;
         }
+
         std::lock_guard<std::mutex> lock(g_mutex);
         int handle = allocate_server_handle();
         g_servers[handle] = server;
-        ZIPC_LOG("ipc_server_create_ex: queue='" << queue_name << "', handle=" << handle
-            << ", threads=" << config.thread_count << ", max_len=" << config.max_queue_length
-            << ", max_msg=" << config.max_msg_size);
+        ZIPC_LOG("ipc_server_create_ex: success, allocated handle=" << handle
+            << ", queue='" << queue_name << "'");
         return handle;
     }
 
@@ -202,6 +236,7 @@ extern "C" {
      * Typically called when shutting down the server or when it is no longer needed.
      */
     int ipc_server_destroy(ipc_server_handle_t handle) {
+        ZIPC_LOG("ipc_server_destroy: called with handle=" << handle);
         if (handle <= 0) {
             ZIPC_LOG("ipc_server_destroy: invalid handle " << handle);
             return IPC_ERR_INVAL;
@@ -216,6 +251,7 @@ extern "C" {
             }
             server = it->second;
             g_servers.erase(it);
+            ZIPC_LOG("ipc_server_destroy: removed handle " << handle << " from map, calling stop()");
         }
         server->stop();
         ZIPC_LOG("ipc_server_destroy: handle " << handle << " destroyed");
@@ -240,6 +276,8 @@ extern "C" {
      */
     int ipc_server_register_binary_reply(ipc_server_handle_t handle, const char* name,
         ipc_binary_reply_handler handler, void* trigger) {
+        ZIPC_LOG("ipc_server_register_binary_reply: handle=" << handle
+            << ", name='" << (name ? name : "null") << "'");
         if (!name || !handler) {
             ZIPC_LOG("ipc_server_register_binary_reply: invalid name or handler");
             return IPC_ERR_INVAL;
@@ -266,6 +304,8 @@ extern "C" {
      * @return IPC_OK on success, IPC_ERR_NOT_FOUND if not registered.
      */
     int ipc_server_unregister_binary_reply(ipc_server_handle_t handle, const char* name) {
+        ZIPC_LOG("ipc_server_unregister_binary_reply: handle=" << handle
+            << ", name='" << (name ? name : "null") << "'");
         if (!name) {
             ZIPC_LOG("ipc_server_unregister_binary_reply: name is null");
             return IPC_ERR_INVAL;
@@ -299,6 +339,8 @@ extern "C" {
      */
     int ipc_server_register_binary_notify(ipc_server_handle_t handle, const char* name,
         ipc_binary_notify_handler handler, void* trigger) {
+        ZIPC_LOG("ipc_server_register_binary_notify: handle=" << handle
+            << ", name='" << (name ? name : "null") << "'");
         if (!name || !handler) {
             ZIPC_LOG("ipc_server_register_binary_notify: invalid name or handler");
             return IPC_ERR_INVAL;
@@ -322,6 +364,8 @@ extern "C" {
      * ipc_server_unregister_binary_notify 每 Unregister a notification handler.
      */
     int ipc_server_unregister_binary_notify(ipc_server_handle_t handle, const char* name) {
+        ZIPC_LOG("ipc_server_unregister_binary_notify: handle=" << handle
+            << ", name='" << (name ? name : "null") << "'");
         if (!name) {
             ZIPC_LOG("ipc_server_unregister_binary_notify: name is null");
             return IPC_ERR_INVAL;
@@ -360,6 +404,10 @@ extern "C" {
     int ipc_server_send_notify_binary(ipc_server_handle_t handle,
         const char* client_resp_queue,
         const char* func_name, const void* data, size_t size) {
+        ZIPC_LOG("ipc_server_send_notify_binary: handle=" << handle
+            << ", queue='" << (client_resp_queue ? client_resp_queue : "null") << "'"
+            << ", func='" << (func_name ? func_name : "null") << "'"
+            << ", size=" << size);
         if (!client_resp_queue || !func_name) {
             ZIPC_LOG("ipc_server_send_notify_binary: invalid parameters");
             return IPC_ERR_INVAL;
@@ -397,7 +445,7 @@ extern "C" {
         std::lock_guard<std::mutex> lock(g_mutex);
         int handle = allocate_client_handle();
         g_clients[handle] = client;
-        ZIPC_LOG("ipc_client_create: handle=" << handle);
+        ZIPC_LOG("ipc_client_create: allocated handle=" << handle);
         return handle;
     }
 
@@ -409,6 +457,7 @@ extern "C" {
      * Disconnects the client (if connected) and removes it from g_clients.
      */
     int ipc_client_destroy(ipc_client_handle_t handle) {
+        ZIPC_LOG("ipc_client_destroy: handle=" << handle);
         if (handle <= 0) {
             ZIPC_LOG("ipc_client_destroy: invalid handle " << handle);
             return IPC_ERR_INVAL;
@@ -423,9 +472,10 @@ extern "C" {
             }
             client = it->second;
             g_clients.erase(it);
+            ZIPC_LOG("ipc_client_destroy: removed handle " << handle << " from map");
         }
         client->disconnect();
-        ZIPC_LOG("ipc_client_destroy: handle=" << handle);
+        ZIPC_LOG("ipc_client_destroy: handle=" << handle << " destroyed");
         return IPC_OK;
     }
 
@@ -441,6 +491,9 @@ extern "C" {
      * underlying message queue connections.
      */
     int ipc_client_connect(ipc_client_handle_t handle, const char* queue_name) {
+        ZIPC_LOG("ipc_client_connect: handle=" << handle
+            << ", queue_name='" << (queue_name ? queue_name : "null") << "'"
+            << ", length=" << (queue_name ? strlen(queue_name) : 0));
         if (!queue_name) {
             ZIPC_LOG("ipc_client_connect: queue_name is null");
             return IPC_ERR_INVAL;
@@ -468,6 +521,7 @@ extern "C" {
      * Closes the response queue and stops the receiver thread.
      */
     int ipc_client_disconnect(ipc_client_handle_t handle) {
+        ZIPC_LOG("ipc_client_disconnect: handle=" << handle);
         if (handle <= 0) {
             ZIPC_LOG("ipc_client_disconnect: invalid handle " << handle);
             return IPC_ERR_INVAL;
@@ -478,7 +532,7 @@ extern "C" {
             return IPC_ERR_INVAL;
         }
         client->disconnect();
-        ZIPC_LOG("ipc_client_disconnect: handle=" << handle);
+        ZIPC_LOG("ipc_client_disconnect: handle=" << handle << " disconnected");
         return IPC_OK;
     }
 
@@ -519,6 +573,8 @@ extern "C" {
      */
     int ipc_client_register_binary_notify(ipc_client_handle_t handle, const char* name,
         ipc_binary_notify_handler handler, void* trigger) {
+        ZIPC_LOG("ipc_client_register_binary_notify: handle=" << handle
+            << ", name='" << (name ? name : "null") << "'");
         if (!name || !handler) {
             ZIPC_LOG("ipc_client_register_binary_notify: invalid name or handler");
             return IPC_ERR_INVAL;
@@ -542,6 +598,8 @@ extern "C" {
      * ipc_client_unregister_binary_notify 每 Unregister a notification handler.
      */
     int ipc_client_unregister_binary_notify(ipc_client_handle_t handle, const char* name) {
+        ZIPC_LOG("ipc_client_unregister_binary_notify: handle=" << handle
+            << ", name='" << (name ? name : "null") << "'");
         if (!name) {
             ZIPC_LOG("ipc_client_unregister_binary_notify: name is null");
             return IPC_ERR_INVAL;
@@ -584,6 +642,9 @@ extern "C" {
     int ipc_client_call_binary(ipc_client_handle_t handle,
         const char* func_name, const void* send_data, size_t send_size,
         void** out_data, size_t* out_size) {
+        ZIPC_LOG("ipc_client_call_binary: handle=" << handle
+            << ", func='" << (func_name ? func_name : "null") << "'"
+            << ", send_size=" << send_size);
         if (!func_name || !out_data || !out_size) {
             ZIPC_LOG("ipc_client_call_binary: invalid parameters");
             return IPC_ERR_INVAL;
@@ -610,9 +671,11 @@ extern "C" {
         if (ret == IPC_OK) {
             *out_data = data;
             *out_size = sz;
+            ZIPC_LOG("ipc_client_call_binary: success, reply_size=" << sz);
         }
-        ZIPC_LOG("ipc_client_call_binary: handle=" << handle << ", func='" << func_name
-            << "', send_size=" << send_size << ", ret=" << ret << ", reply_size=" << sz);
+        else {
+            ZIPC_LOG("ipc_client_call_binary: failed with ret=" << ret);
+        }
         return ret;
     }
 
@@ -629,6 +692,9 @@ extern "C" {
      */
     int ipc_client_notify_binary(ipc_client_handle_t handle,
         const char* func_name, const void* send_data, size_t send_size) {
+        ZIPC_LOG("ipc_client_notify_binary: handle=" << handle
+            << ", func='" << (func_name ? func_name : "null") << "'"
+            << ", send_size=" << send_size);
         if (!func_name) {
             ZIPC_LOG("ipc_client_notify_binary: func_name is null");
             return IPC_ERR_INVAL;
@@ -661,6 +727,7 @@ extern "C" {
      * This timeout affects all subsequent call_binary calls.
      */
     int ipc_client_set_timeout(ipc_client_handle_t handle, int milliseconds) {
+        ZIPC_LOG("ipc_client_set_timeout: handle=" << handle << ", timeout=" << milliseconds << "ms");
         if (milliseconds <= 0) {
             ZIPC_LOG("ipc_client_set_timeout: invalid milliseconds " << milliseconds);
             return IPC_ERR_INVAL;
@@ -675,7 +742,6 @@ extern "C" {
             return IPC_ERR_INVAL;
         }
         client->set_timeout(milliseconds);
-        ZIPC_LOG("ipc_client_set_timeout: handle=" << handle << ", timeout=" << milliseconds << "ms");
         return IPC_OK;
     }
 
@@ -783,19 +849,28 @@ extern "C" {
             ZIPC_LOG("ipc_shutdown: already called, skipping");
             return;
         }
+        ZIPC_LOG("ipc_shutdown: starting shutdown...");
         // Collect all server and client objects.
         std::vector<std::shared_ptr<IpcServer>> servers;
         std::vector<std::shared_ptr<IpcClient>> clients;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
+            ZIPC_LOG("ipc_shutdown: collecting " << g_servers.size() << " servers and "
+                << g_clients.size() << " clients");
             for (auto& kv : g_servers) servers.push_back(kv.second);
             for (auto& kv : g_clients) clients.push_back(kv.second);
             g_servers.clear();
             g_clients.clear();
         }
         // Stop all servers and disconnect all clients.
-        for (auto& s : servers) s->stop();
-        for (auto& c : clients) c->disconnect();
+        for (auto& s : servers) {
+            ZIPC_LOG("ipc_shutdown: stopping server");
+            s->stop();
+        }
+        for (auto& c : clients) {
+            ZIPC_LOG("ipc_shutdown: disconnecting client");
+            c->disconnect();
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
         // No need to restore global cout/cerr 每 we never touched them.

@@ -24,7 +24,9 @@
 #include <thread>
 #include <algorithm>
 #include <iomanip>
-#include <future>   // for std::async (now replaced with std::thread in send_response)
+#include <future>
+#include <fstream>      // for reading /proc
+#include <cctype>       // for isalnum
 
 #ifdef _WIN32
 #include <windows.h>
@@ -70,87 +72,109 @@ static std::string hex_dump(const void* data, size_t size, size_t max_len = 32) 
 
 static const std::string ZERO_SHM_MARKER = "__ZERO__";
 
-IpcServer::IpcServer() = default;
-IpcServer::~IpcServer() { stop(); }
+// ========== 辅助函数 ==========
+static int get_sysctl_int(const std::string& path) {
+    std::ifstream f(path);
+    int val = -1;
+    if (f >> val) return val;
+    return -1;
+}
+static int get_mq_msg_max() {
+    return get_sysctl_int("/proc/sys/fs/mqueue/msg_max");
+}
+static int get_mq_msgsize_max() {
+    return get_sysctl_int("/proc/sys/fs/mqueue/msgsize_max");
+}
+static bool is_valid_queue_name(const std::string& name) {
+    if (name.empty()) return false;
+    for (char c : name) {
+        if (!(std::isalnum(c) || c == '_' || c == '/')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+IpcServer::IpcServer() {
+    ZIPC_LOG("IpcServer constructor");
+}
+IpcServer::~IpcServer() {
+    ZIPC_LOG("IpcServer destructor, calling stop()");
+    stop();
+}
 
 /*----------------------------------------------------------------------------*/
-/**
- * start 每 Initialise the server and start worker threads.
- * @param qname            Main queue name.
- * @param thread_count     Number of worker threads (0 = auto).
- * @param max_queue_length Max pending messages in the queue.
- * @param max_msg_size     Max control message size.
- * @return true on success.
- *
- * Flow:
- * 1. If already running, stop first.
- * 2. Remove any existing queue with the same name, then create it.
- * 3. Set thread_count to min(5, hardware_concurrency) if 0.
- * 4. Set running_=true and active_workers_=thread_count.
- * 5. Launch worker threads, each running worker_thread_func.
- *
- * Called by ipc_server_create_ex (C API). The server is now ready to accept
- * clients and messages.
- */
 bool IpcServer::start(const std::string& qname, int thread_count,
     size_t max_queue_length, size_t max_msg_size) {
-    if (running_) stop();
+    ZIPC_LOG("start: ENTRY qname='" << qname << "', len=" << qname.length()
+        << ", thread_count=" << thread_count
+        << ", max_queue_len=" << max_queue_length
+        << ", max_msg_size=" << max_msg_size);
+    ZIPC_LOG("start: system msg_max=" << get_mq_msg_max()
+        << ", msgsize_max=" << get_mq_msgsize_max());
+
+    if (running_) {
+        ZIPC_LOG("start: already running, stopping first");
+        stop();
+    }
     queue_name_ = qname;
     max_queue_length_ = max_queue_length;
     max_msg_size_ = max_msg_size;
 
-    try {
-        ipc::message_queue::remove(qname.c_str());
-        mq_ = std::make_shared<ipc::message_queue>(
-            ipc::create_only, qname.c_str(), max_queue_length, max_msg_size);
-        ZIPC_LOG("start: created queue '" << qname << "', max_len=" << max_queue_length
-            << ", max_msg=" << max_msg_size);
-    }
-    catch (const ipc::interprocess_exception& e) {
-        ZIPC_LOG("start: failed to create queue '" << qname << "': " << e.what());
+    // 合法性检查
+    if (!is_valid_queue_name(qname)) {
+        ZIPC_LOG("start: INVALID queue name (only alnum, _, / allowed) -> returning false");
         return false;
     }
 
-    if (thread_count == 0) {
-        thread_count = static_cast<int>(std::min<size_t>(5, std::thread::hardware_concurrency()));
+    try {
+        ipc::message_queue::remove(qname.c_str());
+        ZIPC_LOG("start: removed previous queue (if existed)");
+        mq_ = std::make_shared<ipc::message_queue>(
+            ipc::create_only, qname.c_str(), max_queue_length, max_msg_size);
+        ZIPC_LOG("start: created queue '" << qname << "' with max_len=" << max_queue_length
+            << ", max_msg=" << max_msg_size);
     }
-    ZIPC_LOG("start: starting with " << thread_count << " worker threads");
+    catch (const ipc::interprocess_exception& e) {
+        int err = errno;
+        ZIPC_LOG("start: FAILED to create queue: " << e.what()
+            << " errno=" << err << " (" << strerror(err) << ")");
+        ZIPC_LOG("start: msg_max=" << get_mq_msg_max()
+            << ", msgsize_max=" << get_mq_msgsize_max());
+        return false;
+    }
+
+    // 自动线程数
+    if (thread_count == 0) {
+        int hw = std::thread::hardware_concurrency();
+        thread_count = static_cast<int>(std::min<size_t>(5, (size_t)hw));
+        ZIPC_LOG("start: auto thread_count = " << thread_count);
+    }
+    ZIPC_LOG("start: starting " << thread_count << " worker threads");
 
     running_ = true;
-    active_workers_ = thread_count;   // Set active worker count.
+    active_workers_ = thread_count;
     workers_.reserve(thread_count);
     for (int i = 0; i < thread_count; ++i) {
         workers_.emplace_back(&IpcServer::worker_thread_func, this, mq_);
+        ZIPC_LOG("start: worker thread " << i << " launched");
     }
-    ZIPC_LOG("start: server started on queue '" << qname << "'");
+    ZIPC_LOG("start: server started successfully on queue '" << qname << "'");
     return true;
 }
 
 /*----------------------------------------------------------------------------*/
-/**
- * stop 每 Shut down the server and clean up.
- *
- * Flow:
- * 1. If not running, return.
- * 2. Set running_=false and notify all workers via condition variable.
- * 3. Wait for active_workers_ to reach 0, with a timeout of 2 seconds.
- * 4. If timeout, detach any remaining joinable threads (last resort).
- * 5. Otherwise, join all threads.
- * 6. Clear the workers vector and remove the main queue.
- *
- * Called by ipc_server_destroy (C API) or destructor.
- * The use of active_workers_ allows all threads to exit concurrently without
- * per-thread join delays.
- */
 void IpcServer::stop() {
-    if (!running_) return;
-    ZIPC_LOG("stop: stopping server...");
-
-    // 1. Send exit signal.
+    ZIPC_LOG("stop: ENTRY");
+    if (!running_) {
+        ZIPC_LOG("stop: already stopped, return");
+        return;
+    }
+    ZIPC_LOG("stop: setting running_=false, notifying workers");
     running_ = false;
     cv_.notify_all();
 
-    // 2. Wait for all workers to exit (total timeout 2 seconds).
+    // 等待工作线程退出（最多 2 秒）
     const auto timeout = std::chrono::seconds(2);
     auto start = std::chrono::steady_clock::now();
     while (active_workers_ > 0 &&
@@ -158,155 +182,129 @@ void IpcServer::stop() {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    // 3. If still alive, force detach.
     if (active_workers_ > 0) {
-        ZIPC_LOG("stop: timeout waiting for workers, forcing detach");
+        ZIPC_LOG("stop: timeout, " << active_workers_ << " workers remain, detaching");
         for (size_t i = 0; i < workers_.size(); ++i) {
             if (workers_[i].joinable()) {
                 workers_[i].detach();
+                ZIPC_LOG("stop: detached worker " << i);
             }
         }
     }
     else {
-        // All threads exited, join them normally.
+        ZIPC_LOG("stop: all workers exited, joining");
         for (auto& t : workers_) {
             if (t.joinable()) {
                 try {
                     t.join();
+                    ZIPC_LOG("stop: joined a worker");
                 }
                 catch (...) {
-                    // Ignore join exceptions.
+                    ZIPC_LOG("stop: exception joining worker");
                 }
             }
         }
     }
-
     workers_.clear();
 
     ipc::message_queue::remove(queue_name_.c_str());
-    ZIPC_LOG("stop: server stopped, queue removed");
+    ZIPC_LOG("stop: removed queue '" << queue_name_ << "'");
+    ZIPC_LOG("stop: server stopped");
 }
 
 /*----------------------------------------------------------------------------*/
-/**
- * register_binary_reply 每 Register a handler for RPC requests.
- * @param name     Function name.
- * @param h        Callback.
- * @param trigger  User pointer.
- * @return IPC_OK on success, IPC_ERR_BUSY if already registered.
- *
- * The handler is stored in binary_reply_handlers_ map, protected by handlers_mutex_.
- * It will be invoked by worker threads when a REQ message with matching name arrives.
- */
 int IpcServer::register_binary_reply(const std::string& name,
     ipc_binary_reply_handler h, void* trigger) {
+    ZIPC_LOG("register_binary_reply: ENTRY name='" << name << "'");
     if (!running_) {
-        ZIPC_LOG("register_binary_reply: server not running");
+        ZIPC_LOG("register_binary_reply: server not running, return IPC_ERR_OPEN");
         return IPC_ERR_OPEN;
     }
     std::lock_guard<std::mutex> lock(handlers_mutex_);
     if (binary_reply_handlers_.find(name) != binary_reply_handlers_.end()) {
-        ZIPC_LOG("register_binary_reply: handler '" << name << "' already exists");
+        ZIPC_LOG("register_binary_reply: handler already exists for '" << name << "'");
         return IPC_ERR_BUSY;
     }
     binary_reply_handlers_[name] = { h, trigger };
-    ZIPC_LOG("register_binary_reply: registered binary reply handler '" << name << "'");
+    ZIPC_LOG("register_binary_reply: registered handler for '" << name
+        << "' (trigger=" << trigger << ")");
     return IPC_OK;
 }
 
-/**
- * unregister_binary_reply 每 Remove an RPC handler.
- */
 int IpcServer::unregister_binary_reply(const std::string& name) {
+    ZIPC_LOG("unregister_binary_reply: ENTRY name='" << name << "'");
     std::lock_guard<std::mutex> lock(handlers_mutex_);
     auto it = binary_reply_handlers_.find(name);
     if (it == binary_reply_handlers_.end()) {
-        ZIPC_LOG("unregister_binary_reply: handler '" << name << "' not found");
+        ZIPC_LOG("unregister_binary_reply: handler not found");
         return IPC_ERR_NOT_FOUND;
     }
     binary_reply_handlers_.erase(it);
-    ZIPC_LOG("unregister_binary_reply: unregistered binary reply handler '" << name << "'");
+    ZIPC_LOG("unregister_binary_reply: unregistered handler '" << name << "'");
     return IPC_OK;
 }
 
-/**
- * register_binary_notify 每 Register a handler for client↙server notifications.
- */
 int IpcServer::register_binary_notify(const std::string& name,
     ipc_binary_notify_handler h, void* trigger) {
+    ZIPC_LOG("register_binary_notify: ENTRY name='" << name << "'");
     if (!running_) {
         ZIPC_LOG("register_binary_notify: server not running");
         return IPC_ERR_OPEN;
     }
     std::lock_guard<std::mutex> lock(handlers_mutex_);
     if (binary_notify_handlers_.find(name) != binary_notify_handlers_.end()) {
-        ZIPC_LOG("register_binary_notify: handler '" << name << "' already exists");
+        ZIPC_LOG("register_binary_notify: handler already exists");
         return IPC_ERR_BUSY;
     }
     binary_notify_handlers_[name] = { h, trigger };
-    ZIPC_LOG("register_binary_notify: registered binary notify handler '" << name << "'");
+    ZIPC_LOG("register_binary_notify: registered notify handler for '" << name << "'");
     return IPC_OK;
 }
 
-/**
- * unregister_binary_notify 每 Remove a notification handler.
- */
 int IpcServer::unregister_binary_notify(const std::string& name) {
+    ZIPC_LOG("unregister_binary_notify: ENTRY name='" << name << "'");
     std::lock_guard<std::mutex> lock(handlers_mutex_);
     auto it = binary_notify_handlers_.find(name);
     if (it == binary_notify_handlers_.end()) {
-        ZIPC_LOG("unregister_binary_notify: handler '" << name << "' not found");
+        ZIPC_LOG("unregister_binary_notify: handler not found");
         return IPC_ERR_NOT_FOUND;
     }
     binary_notify_handlers_.erase(it);
-    ZIPC_LOG("unregister_binary_notify: unregistered binary notify handler '" << name << "'");
+    ZIPC_LOG("unregister_binary_notify: unregistered '" << name << "'");
     return IPC_OK;
 }
 
 /*----------------------------------------------------------------------------*/
-/**
- * send_notify_binary 每 Send a binary notification from the server to a client.
- * @param client_resp_queue  Client's response queue name.
- * @param func               Notification name.
- * @param data               Payload.
- * @param size               Payload size.
- * @return IPC_OK on success.
- *
- * Flow:
- * 1. Validate parameters.
- * 2. If size>0, create shared memory segment and copy data.
- * 3. Format a NOTIFY control message and send it to the client's response queue.
- *
- * Called by ipc_server_send_notify_binary (C API).
- */
 int IpcServer::send_notify_binary(const std::string& client_resp_queue,
     const std::string& func, const void* data, size_t size) {
+    ZIPC_LOG("send_notify_binary: ENTRY queue='" << client_resp_queue
+        << "', func='" << func << "', size=" << size);
     if (!running_) {
         ZIPC_LOG("send_notify_binary: server not running");
         return IPC_ERR_OPEN;
     }
     if (size > 512 * 1024 * 1024) {
-        ZIPC_LOG("send_notify_binary: size " << size << " exceeds 512MB");
+        ZIPC_LOG("send_notify_binary: size too large (>512MB)");
         return IPC_ERR_SIZE;
     }
 
     if (size > 0 && data) {
-        ZIPC_LOG("send_notify_binary: func='" << func << "', size=" << size
-            << ", hex=" << hex_dump(data, size));
+        ZIPC_LOG("send_notify_binary: data hex=" << hex_dump(data, size));
         ZIPC_LOG_MD5("send_notify_binary sent data", data, size);
     }
     else {
-        ZIPC_LOG("send_notify_binary: func='" << func << "', zero-size");
+        ZIPC_LOG("send_notify_binary: zero-size data");
     }
 
     std::string shm_name;
     if (size == 0) {
         shm_name = ZERO_SHM_MARKER;
-        ZIPC_LOG("send_notify_binary: zero-size data, using marker");
+        ZIPC_LOG("send_notify_binary: using ZERO marker");
     }
     else {
         shm_name = generate_unique_shm_name();
         ipc::shared_memory_object::remove(shm_name.c_str());
+        ZIPC_LOG("send_notify_binary: creating shared memory '" << shm_name << "'");
         try {
             ipc::shared_memory_object shm(ipc::create_only, shm_name.c_str(), ipc::read_write);
             shm.truncate(size);
@@ -314,10 +312,10 @@ int IpcServer::send_notify_binary(const std::string& client_resp_queue,
             if (data && size > 0) {
                 std::memcpy(region.get_address(), data, size);
             }
-            ZIPC_LOG("send_notify_binary: created shared memory '" << shm_name << "', size=" << size);
+            ZIPC_LOG("send_notify_binary: shared memory created, size=" << size);
         }
         catch (const std::exception& e) {
-            ZIPC_LOG("send_notify_binary: failed to create shared memory: " << e.what());
+            ZIPC_LOG("send_notify_binary: failed to create shm: " << e.what());
             ipc::shared_memory_object::remove(shm_name.c_str());
             return IPC_ERR_MEMORY;
         }
@@ -334,16 +332,15 @@ int IpcServer::send_notify_binary(const std::string& client_resp_queue,
     try {
         ipc::message_queue mq(ipc::open_only, client_resp_queue.c_str());
         if (!mq.try_send(msg.c_str(), msg.size(), 0)) {
-            ZIPC_LOG("send_notify_binary: queue '" << client_resp_queue << "' full");
+            ZIPC_LOG("send_notify_binary: queue full, send failed");
             if (shm_name != ZERO_SHM_MARKER)
                 ipc::shared_memory_object::remove(shm_name.c_str());
             return IPC_ERR_BUSY;
         }
-        ZIPC_LOG("send_notify_binary: sent to '" << client_resp_queue << "', func='" << func
-            << "', shm='" << shm_name << "', size=" << size);
+        ZIPC_LOG("send_notify_binary: sent to '" << client_resp_queue << "', msg='" << msg << "'");
     }
     catch (const std::exception& e) {
-        ZIPC_LOG("send_notify_binary: failed to send to '" << client_resp_queue << "': " << e.what());
+        ZIPC_LOG("send_notify_binary: exception sending: " << e.what());
         if (shm_name != ZERO_SHM_MARKER)
             ipc::shared_memory_object::remove(shm_name.c_str());
         return IPC_ERR_SEND;
@@ -352,23 +349,7 @@ int IpcServer::send_notify_binary(const std::string& client_resp_queue,
 }
 
 /*----------------------------------------------------------------------------*/
-/**
- * worker_thread_func 每 Main loop for each worker thread.
- * @param mq  Shared pointer to the main message queue.
- *
- * This thread runs while running_ is true. It polls the main queue for messages
- * and dispatches them:
- * - REQ messages: extracts function name, request ID, response queue, and shared memory name.
- *   Finds the registered reply handler, invokes it to get a reply, then sends
- *   the reply via send_response().
- * - NOTIFY messages: extracts notification name and shared memory name, invokes
- *   the registered notify handler.
- *
- * The thread uses a condition variable to wait when the queue is empty.
- * It also decrements active_workers_ upon exit using the WorkerGuard RAII helper.
- */
 void IpcServer::worker_thread_func(std::shared_ptr<ipc::message_queue> mq) {
-    // WorkerGuard ensures active_workers_ is decremented when the thread exits.
     struct WorkerGuard {
         IpcServer* server;
         WorkerGuard(IpcServer* s) : server(s) {}
@@ -391,9 +372,7 @@ void IpcServer::worker_thread_func(std::shared_ptr<ipc::message_queue> mq) {
                 unsigned priority;
                 if (mq->try_receive(buffer.data(), buffer.size(), recvd, priority)) {
                     std::string msg(buffer.data(), recvd);
-
-                    // We no longer process __STOP__ messages; the loop exits
-                    // when running_ becomes false.
+                    ZIPC_LOG("worker_thread: received message: '" << msg << "'");
 
                     size_t first_pipe = msg.find('|');
                     if (first_pipe == std::string::npos) {
@@ -401,18 +380,19 @@ void IpcServer::worker_thread_func(std::shared_ptr<ipc::message_queue> mq) {
                         continue;
                     }
                     std::string type = msg.substr(0, first_pipe);
+                    ZIPC_LOG("worker_thread: message type = '" << type << "'");
 
                     if (type == "REQ") {
                         // Format: REQ|req_id|resp_queue|BIN|func|shm_name
                         size_t pos1 = first_pipe;
                         size_t pos2 = msg.find('|', pos1 + 1);
-                        if (pos2 == std::string::npos) continue;
+                        if (pos2 == std::string::npos) { ZIPC_LOG("worker_thread: REQ missing field"); continue; }
                         size_t pos3 = msg.find('|', pos2 + 1);
-                        if (pos3 == std::string::npos) continue;
+                        if (pos3 == std::string::npos) { ZIPC_LOG("worker_thread: REQ missing field"); continue; }
                         size_t pos4 = msg.find('|', pos3 + 1);
-                        if (pos4 == std::string::npos) continue;
+                        if (pos4 == std::string::npos) { ZIPC_LOG("worker_thread: REQ missing field"); continue; }
                         size_t pos5 = msg.find('|', pos4 + 1);
-                        if (pos5 == std::string::npos) continue;
+                        if (pos5 == std::string::npos) { ZIPC_LOG("worker_thread: REQ missing field"); continue; }
 
                         uint64_t req_id = 0;
                         try {
@@ -428,7 +408,8 @@ void IpcServer::worker_thread_func(std::shared_ptr<ipc::message_queue> mq) {
                         std::string shm_name = msg.substr(pos5 + 1);
 
                         ZIPC_LOG("worker_thread: REQ req_id=" << req_id << ", resp_queue='" << resp_queue
-                            << "', type=" << msg_type << ", func='" << func << "'");
+                            << "', msg_type=" << msg_type << ", func='" << func
+                            << "', shm='" << shm_name << "'");
 
                         int status = IPC_OK;
                         void* reply_bin = nullptr;
@@ -452,15 +433,14 @@ void IpcServer::worker_thread_func(std::shared_ptr<ipc::message_queue> mq) {
                                     region = ipc::mapped_region(shm, ipc::read_only);
                                     bin_data = region.get_address();
                                     bin_size = region.get_size();
-                                    ZIPC_LOG("worker_thread: REQ binary data size=" << bin_size
+                                    ZIPC_LOG("worker_thread: request data size=" << bin_size
                                         << ", hex=" << hex_dump(bin_data, bin_size));
                                     ZIPC_LOG_MD5("worker_thread received binary request", bin_data, bin_size);
                                     ipc::shared_memory_object::remove(shm_name.c_str());
                                     shm_ok = true;
                                 }
                                 catch (const std::exception& e) {
-                                    ZIPC_LOG("worker_thread: failed to open shared memory '" << shm_name
-                                        << "': " << e.what());
+                                    ZIPC_LOG("worker_thread: failed to open shm '" << shm_name << "': " << e.what());
                                     ipc::shared_memory_object::remove(shm_name.c_str());
                                     status = IPC_ERR_RECEIVE;
                                 }
@@ -475,21 +455,22 @@ void IpcServer::worker_thread_func(std::shared_ptr<ipc::message_queue> mq) {
                                     if (it != binary_reply_handlers_.end()) {
                                         h = it->second.first;
                                         trigger = it->second.second;
-                                        ZIPC_LOG("worker_thread: found binary reply handler for '" << func << "'");
+                                        ZIPC_LOG("worker_thread: found reply handler for '" << func << "'");
                                     }
                                     else {
-                                        ZIPC_LOG("worker_thread: binary reply handler not found for '" << func << "'");
+                                        ZIPC_LOG("worker_thread: no reply handler for '" << func << "'");
                                     }
                                 }
                                 if (h) {
                                     void* out = nullptr;
                                     size_t out_size = 0;
                                     try {
+                                        ZIPC_LOG("worker_thread: calling handler for '" << func << "'");
                                         h(trigger, bin_data, bin_size, &out, &out_size);
-                                        ZIPC_LOG("worker_thread: binary reply handler executed, out_size=" << out_size);
+                                        ZIPC_LOG("worker_thread: handler returned out_size=" << out_size);
                                     }
                                     catch (...) {
-                                        ZIPC_LOG("worker_thread: binary reply handler threw exception");
+                                        ZIPC_LOG("worker_thread: handler threw exception");
                                         status = IPC_ERR_UNKNOWN;
                                         if (out) ipc_free(out);
                                     }
@@ -511,12 +492,12 @@ void IpcServer::worker_thread_func(std::shared_ptr<ipc::message_queue> mq) {
                             ZIPC_LOG("worker_thread: unknown msg_type '" << msg_type << "'");
                         }
 
-                        // Send response (binary)
+                        // 发送响应
                         if (status == IPC_OK) {
                             std::string shm_name_resp;
                             if (reply_size == 0) {
                                 shm_name_resp = ZERO_SHM_MARKER;
-                                ZIPC_LOG("worker_thread: zero-size binary response");
+                                ZIPC_LOG("worker_thread: zero-size response");
                             }
                             else {
                                 shm_name_resp = generate_unique_shm_name();
@@ -526,13 +507,13 @@ void IpcServer::worker_thread_func(std::shared_ptr<ipc::message_queue> mq) {
                                     shm.truncate(reply_size);
                                     ipc::mapped_region region(shm, ipc::read_write);
                                     std::memcpy(region.get_address(), reply_bin, reply_size);
-                                    ZIPC_LOG("worker_thread: binary reply size=" << reply_size
+                                    ZIPC_LOG("worker_thread: response data size=" << reply_size
                                         << ", hex=" << hex_dump(reply_bin, reply_size));
                                     ZIPC_LOG_MD5("worker_thread binary reply", reply_bin, reply_size);
                                     ipc_free(reply_bin);
                                 }
                                 catch (const std::exception& e) {
-                                    ZIPC_LOG("worker_thread: failed to create response shared memory: " << e.what());
+                                    ZIPC_LOG("worker_thread: failed to create response shm: " << e.what());
                                     ipc::shared_memory_object::remove(shm_name_resp.c_str());
                                     ipc_free(reply_bin);
                                     send_response(resp_queue, req_id, IPC_ERR_MEMORY, "");
@@ -543,6 +524,7 @@ void IpcServer::worker_thread_func(std::shared_ptr<ipc::message_queue> mq) {
                         }
                         else {
                             if (reply_bin) ipc_free(reply_bin);
+                            ZIPC_LOG("worker_thread: sending error response status=" << status);
                             send_response(resp_queue, req_id, status, "");
                         }
                     }
@@ -550,15 +532,16 @@ void IpcServer::worker_thread_func(std::shared_ptr<ipc::message_queue> mq) {
                         // Format: NOTIFY|type|func|data   (type always "BIN")
                         size_t pos1 = first_pipe;
                         size_t pos2 = msg.find('|', pos1 + 1);
-                        if (pos2 == std::string::npos) continue;
+                        if (pos2 == std::string::npos) { ZIPC_LOG("worker_thread: NOTIFY missing field"); continue; }
                         size_t pos3 = msg.find('|', pos2 + 1);
-                        if (pos3 == std::string::npos) continue;
+                        if (pos3 == std::string::npos) { ZIPC_LOG("worker_thread: NOTIFY missing field"); continue; }
 
                         std::string notify_type = msg.substr(pos1 + 1, pos2 - pos1 - 1);
                         std::string func = msg.substr(pos2 + 1, pos3 - pos2 - 1);
                         std::string shm_name = msg.substr(pos3 + 1);
 
-                        ZIPC_LOG("worker_thread: NOTIFY type=" << notify_type << ", func='" << func << "'");
+                        ZIPC_LOG("worker_thread: NOTIFY type=" << notify_type << ", func='" << func
+                            << "', shm='" << shm_name << "'");
 
                         if (notify_type == "BIN") {
                             if (shm_name == ZERO_SHM_MARKER) {
@@ -570,19 +553,19 @@ void IpcServer::worker_thread_func(std::shared_ptr<ipc::message_queue> mq) {
                                     if (it != binary_notify_handlers_.end()) {
                                         h = it->second.first;
                                         trigger = it->second.second;
-                                        ZIPC_LOG("worker_thread: found binary notify handler for '" << func << "'");
+                                        ZIPC_LOG("worker_thread: found notify handler for '" << func << "'");
                                     }
                                     else {
-                                        ZIPC_LOG("worker_thread: binary notify handler not found for '" << func << "'");
+                                        ZIPC_LOG("worker_thread: no notify handler for '" << func << "'");
                                     }
                                 }
                                 if (h) {
                                     try {
                                         h(trigger, nullptr, 0);
-                                        ZIPC_LOG("worker_thread: zero-size binary notify handler executed");
+                                        ZIPC_LOG("worker_thread: zero-size notify handler executed");
                                     }
                                     catch (...) {
-                                        ZIPC_LOG("worker_thread: binary notify handler threw exception");
+                                        ZIPC_LOG("worker_thread: notify handler threw exception");
                                     }
                                 }
                             }
@@ -592,7 +575,7 @@ void IpcServer::worker_thread_func(std::shared_ptr<ipc::message_queue> mq) {
                                     ipc::mapped_region region(shm, ipc::read_only);
                                     const void* bin_data = region.get_address();
                                     size_t bin_size = region.get_size();
-                                    ZIPC_LOG("worker_thread: NOTIFY binary data size=" << bin_size
+                                    ZIPC_LOG("worker_thread: notify data size=" << bin_size
                                         << ", hex=" << hex_dump(bin_data, bin_size));
                                     ZIPC_LOG_MD5("worker_thread binary notify received", bin_data, bin_size);
 
@@ -604,25 +587,25 @@ void IpcServer::worker_thread_func(std::shared_ptr<ipc::message_queue> mq) {
                                         if (it != binary_notify_handlers_.end()) {
                                             h = it->second.first;
                                             trigger = it->second.second;
-                                            ZIPC_LOG("worker_thread: found binary notify handler for '" << func << "'");
+                                            ZIPC_LOG("worker_thread: found notify handler for '" << func << "'");
                                         }
                                         else {
-                                            ZIPC_LOG("worker_thread: binary notify handler not found for '" << func << "'");
+                                            ZIPC_LOG("worker_thread: no notify handler for '" << func << "'");
                                         }
                                     }
                                     if (h) {
                                         try {
                                             h(trigger, bin_data, bin_size);
-                                            ZIPC_LOG("worker_thread: binary notify handler executed, size=" << bin_size);
+                                            ZIPC_LOG("worker_thread: notify handler executed, size=" << bin_size);
                                         }
                                         catch (...) {
-                                            ZIPC_LOG("worker_thread: binary notify handler threw exception");
+                                            ZIPC_LOG("worker_thread: notify handler threw exception");
                                         }
                                     }
                                     ipc::shared_memory_object::remove(shm_name.c_str());
                                 }
                                 catch (const std::exception& e) {
-                                    ZIPC_LOG("worker_thread: failed to open binary notify shared memory: " << e.what());
+                                    ZIPC_LOG("worker_thread: failed to open notify shm: " << e.what());
                                     ipc::shared_memory_object::remove(shm_name.c_str());
                                 }
                             }
@@ -636,7 +619,7 @@ void IpcServer::worker_thread_func(std::shared_ptr<ipc::message_queue> mq) {
                     }
                 }
                 else {
-                    // Queue empty: wait with condition variable to avoid busy loop.
+                    // 队列空，等待
                     std::unique_lock<std::mutex> lock(cv_mutex_);
                     cv_.wait_for(lock, std::chrono::milliseconds(10),
                         [this] { return !running_; });
@@ -651,7 +634,7 @@ void IpcServer::worker_thread_func(std::shared_ptr<ipc::message_queue> mq) {
         }
     }
     catch (const std::exception& e) {
-        ZIPC_LOG("worker_thread: fatal std::exception: " << e.what());
+        ZIPC_LOG("worker_thread: fatal exception: " << e.what());
     }
     catch (...) {
         ZIPC_LOG("worker_thread: fatal unknown exception");
@@ -660,31 +643,21 @@ void IpcServer::worker_thread_func(std::shared_ptr<ipc::message_queue> mq) {
 }
 
 /*----------------------------------------------------------------------------*/
-/**
- * send_response 每 Send an RPC reply to a client.
- * @param resp_queue  Client's response queue name.
- * @param req_id      Request ID.
- * @param status      Return code.
- * @param shm_name    Name of shared memory containing the reply (or ZERO marker).
- *
- * Formats a RSP message and sends it to the client's response queue.
- * If the reply data is in shared memory, this function will also schedule a
- * delayed cleanup of that shared memory (using a detached thread) to avoid leaks
- * if the client never reads it.
- *
- * Called by worker_thread_func after handling a REQ.
- */
 void IpcServer::send_response(const std::string& resp_queue, uint64_t req_id,
     int status, const std::string& shm_name) {
+    ZIPC_LOG("send_response: ENTRY resp_queue='" << resp_queue << "', req_id=" << req_id
+        << ", status=" << status << ", shm_name='" << shm_name << "'");
+
     std::string msg = "RSP|" + std::to_string(req_id) + "|" + std::to_string(status) +
         "|BIN|" + shm_name;
     if (msg.size() > max_msg_size_) {
+        ZIPC_LOG("send_response: response too large (" << msg.size() << " > " << max_msg_size_ << ")");
         if (!shm_name.empty() && shm_name != ZERO_SHM_MARKER) {
             ipc::shared_memory_object::remove(shm_name.c_str());
-            ZIPC_LOG("send_response: response too large, cleaned up shm '" << shm_name << "'");
+            ZIPC_LOG("send_response: removed shm due to size overflow");
         }
         msg = "RSP|" + std::to_string(req_id) + "|" + std::to_string(IPC_ERR_SIZE) + "|BIN|";
-        ZIPC_LOG("send_response: response too large, truncated to error");
+        ZIPC_LOG("send_response: truncated to error response");
     }
 
     bool send_ok = false;
@@ -692,27 +665,24 @@ void IpcServer::send_response(const std::string& resp_queue, uint64_t req_id,
         ipc::message_queue mq(ipc::open_only, resp_queue.c_str());
         if (mq.try_send(msg.c_str(), msg.size(), 0)) {
             send_ok = true;
-            ZIPC_LOG("send_response: sent response req_id=" << req_id << " to '" << resp_queue
-                << "', status=" << status);
+            ZIPC_LOG("send_response: sent response to '" << resp_queue << "', msg='" << msg << "'");
         }
         else {
-            ZIPC_LOG("send_response: queue '" << resp_queue << "' full for req_id=" << req_id);
+            ZIPC_LOG("send_response: queue full, send failed");
         }
     }
     catch (const std::exception& e) {
-        ZIPC_LOG("send_response: failed to send response to '" << resp_queue << "': " << e.what());
+        ZIPC_LOG("send_response: exception sending: " << e.what());
     }
 
-    // If the response was sent successfully and we used a real shared memory
-    // (not the zero marker), schedule a delayed cleanup to remove the memory
-    // even if the client never fetches it (e.g., due to timeout or disconnect).
+    // 延迟清理共享内存（如果发送成功且不是 ZERO）
     if (send_ok && !shm_name.empty() && shm_name != ZERO_SHM_MARKER) {
-        // Launch a detached thread to perform cleanup after 10 seconds.
+        ZIPC_LOG("send_response: scheduling delayed cleanup for shm '" << shm_name << "'");
         std::thread([shm_name]() {
             std::this_thread::sleep_for(std::chrono::seconds(10));
             try {
                 ipc::shared_memory_object::remove(shm_name.c_str());
-                ZIPC_LOG("send_response: delayed cleanup removed shared memory " << shm_name);
+                ZIPC_LOG("send_response: delayed cleanup removed shm " << shm_name);
             }
             catch (...) {
                 // ignore
@@ -720,21 +690,13 @@ void IpcServer::send_response(const std::string& resp_queue, uint64_t req_id,
             }).detach();
     }
 
-    // If send failed, remove immediately.
     if (!send_ok && !shm_name.empty() && shm_name != ZERO_SHM_MARKER) {
         ipc::shared_memory_object::remove(shm_name.c_str());
-        ZIPC_LOG("send_response: removed shared memory due to send failure");
+        ZIPC_LOG("send_response: immediately removed shm due to send failure");
     }
 }
 
 /*----------------------------------------------------------------------------*/
-/**
- * generate_unique_shm_name 每 Create a unique name for a shared memory segment.
- * @return String like "ipc_shm_resp_<pid>_<seq>_<timestamp>".
- *
- * Used to avoid collisions when multiple servers or clients create shared memory.
- * Called whenever the server needs to allocate shared memory for a response.
- */
 std::string IpcServer::generate_unique_shm_name() {
     static std::atomic<uint64_t> counter{ 0 };
 #ifdef _WIN32
@@ -746,5 +708,7 @@ std::string IpcServer::generate_unique_shm_name() {
     auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
     std::stringstream ss;
     ss << "ipc_shm_resp_" << pid << "_" << seq << "_" << std::hex << now;
-    return ss.str();
+    std::string name = ss.str();
+    ZIPC_LOG("generate_unique_shm_name: generated '" << name << "'");
+    return name;
 }

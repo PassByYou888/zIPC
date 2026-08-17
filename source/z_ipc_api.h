@@ -47,8 +47,8 @@ extern "C" {
     typedef void (*status_handler)(int);
 
     /**
-     * Server?side callback for binary RPC requests.
-     * @param trigger    user?supplied pointer
+     * Server-side callback for binary RPC requests.
+     * @param trigger    user-supplied pointer
      * @param data       request payload
      * @param size       payload size
      * @param out_reply  output buffer (must be allocated with ipc_alloc)
@@ -60,7 +60,7 @@ extern "C" {
 
     /**
      * Handler for binary notifications (both client and server sides).
-     * @param trigger    user?supplied pointer
+     * @param trigger    user-supplied pointer
      * @param data       notification payload
      * @param size       payload size
      * @warning Must not block; must return quickly.
@@ -72,23 +72,26 @@ extern "C" {
     typedef int ipc_server_handle_t;  /**< Opaque server handle */
     typedef int ipc_client_handle_t;  /**< Opaque client handle */
 
-    /* ========================== Server Configuration ========================== */
-
-    /** Server creation parameters */
-    typedef struct {
-        int thread_count;        /**< Number of worker threads (0 = auto) */
-        size_t max_queue_length; /**< Maximum number of pending messages */
-        size_t max_msg_size;     /**< Maximum message size (control messages) */
-    } ipc_server_config_t;
-
     /* ========================== Server API ========================== */
 
-    /** Create a server with default configuration (max_queue=1000, max_msg=1024) */
+    /**
+     * Create a server with default configuration.
+     * @param queue_name   Name of the main message queue.
+     * @param thread_count Number of worker threads (0 = auto).
+     * @return Server handle (non-zero) on success, 0 on failure.
+     */
     ipc_server_handle_t ipc_server_create(const char* queue_name, int thread_count);
 
-    /** Create a server with explicit configuration */
+    /**
+     * Create a server with explicit parameters.
+     * @param queue_name        Name of the main message queue.
+     * @param thread_count      Number of worker threads (0 = auto).
+     * @param max_queue_length  Maximum number of pending messages in the queue.
+     * @param max_msg_size      Maximum size (in bytes) of control messages.
+     * @return Server handle (non-zero) on success, 0 on failure.
+     */
     ipc_server_handle_t ipc_server_create_ex(const char* queue_name,
-        const ipc_server_config_t* cfg);
+        int thread_count, size_t max_queue_length, size_t max_msg_size);
 
     /** Destroy a server and release resources */
     int ipc_server_destroy(ipc_server_handle_t handle);
