@@ -1,7 +1,15 @@
 /**
  * @file z_ipc_server_impl.h
- * @brief Declaration of the IpcServer class that implements server?side
- *        logic for handling RPC requests and notifications.
+ * @brief Server declaration with health monitoring and RAII.
+ *
+ * This revision fixes:
+ *   - S1: stop() uses timeout-based join, no detach (except extreme case).
+ *   - S2: Shared memory remove after region destruction (RAII).
+ *   - S3: No per-response detached thread; cleanup via lease or client.
+ *   - S4: String parsing retained for ABI compatibility, but with added checks.
+ *   - S5: Strict queue name validation (alnum and underscore only).
+ *   - S6: Defensive parameter correction for extreme values.
+ *   - New: Worker heartbeat monitoring.
  */
 
 #pragma once
@@ -18,31 +26,9 @@
 #include <memory>
 #include <mutex>
 #include <condition_variable>
-#include <utility>
+#include <chrono>
 
 namespace ipc = boost::interprocess;
-
-/**
- * RAII helper to automatically remove a shared memory object upon destruction.
- * Call release() if the memory should be kept alive beyond the guard's scope.
- */
-class SharedMemoryGuard {
-public:
-    explicit SharedMemoryGuard(const std::string& name) : name_(name) {}
-    ~SharedMemoryGuard() {
-        if (!name_.empty()) {
-            try {
-                ipc::shared_memory_object::remove(name_.c_str());
-            }
-            catch (...) {
-                // Ignore errors during cleanup
-            }
-        }
-    }
-    void release() { name_.clear(); }   // Prevent removal on destruction
-private:
-    std::string name_;
-};
 
 /**
  * IpcServer ¨C server for binary IPC.
@@ -56,7 +42,7 @@ public:
 
     /**
      * Start the server.
-     * @param queue_name      name of the main queue
+     * @param queue_name      name of the main queue (alnum + underscore only)
      * @param thread_count    number of worker threads (0 = auto)
      * @param max_queue_length maximum pending messages
      * @param max_msg_size    maximum message size for control messages
@@ -77,7 +63,7 @@ public:
     /** Unregister a binary RPC handler. */
     int unregister_binary_reply(const std::string& name);
 
-    /** Register a binary notify handler (client¡úserver). */
+    /** Register a binary notify handler (client->server). */
     int register_binary_notify(const std::string& name,
         ipc_binary_notify_handler h, void* trigger);
 
@@ -90,7 +76,10 @@ public:
 
 private:
     /** Worker thread function ¨C processes incoming messages. */
-    void worker_thread_func(std::shared_ptr<ipc::message_queue> mq);
+    void worker_thread_func(std::shared_ptr<ipc::message_queue> mq, int worker_id);
+
+    /** Health monitor thread ¨C checks worker heartbeats. */
+    void monitor_thread_func();
 
     /** Send an RPC response to a client. */
     void send_response(const std::string& resp_queue, uint64_t req_id,
@@ -110,6 +99,12 @@ private:
 
     std::atomic<bool> running_{ false };
     std::vector<std::thread> workers_;
+    // Heartbeat timestamps for each worker
+    std::vector<std::chrono::steady_clock::time_point> worker_last_active_;
+    std::mutex worker_heartbeat_mutex_;
+
+    std::thread monitor_;
+    std::atomic<bool> monitor_running_{ false };
 
     std::mutex cv_mutex_;
     std::condition_variable cv_;
