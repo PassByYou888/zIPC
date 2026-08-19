@@ -39,6 +39,8 @@ extern "C" {
 #define IPC_ERR_NOT_FOUND   -9   /**< Handler or resource not found */
 #define IPC_ERR_BUSY        -10  /**< Resource busy (handler already exists) */
 #define IPC_ERR_INVAL       -11  /**< Invalid argument */
+#define IPC_ERR_RECURSION   -12  /**< Recursive call detected inside callback */
+#define IPC_ERR_CANCELED    -13  /**< Operation canceled */
 #define IPC_ERR_UNKNOWN     -99  /**< Unknown error */
 
 /* ========================== Callback Types ========================== */
