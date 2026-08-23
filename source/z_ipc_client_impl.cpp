@@ -1,6 +1,6 @@
 /**
  * @file z_ipc_client_impl.cpp
- * @brief Client implementation ¨C fully hardened with cancellation and RAII.
+ * @brief Client implementation ¨C hardened with non-blocking sends, exception safety, and data integrity checks.
  */
 
 #include "z_ipc_client_impl.h"
@@ -19,6 +19,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <io.h>
 #else
 #include <unistd.h>
 #include <sys/stat.h>
@@ -59,8 +60,37 @@ static const int LEASE_TIMEOUT_SEC = 30;  // seconds
 
 thread_local bool IpcClient::tls_in_callback_ = false;
 
-// ---------- RAII lease for shared memory cleanup ----------
-// FIX S2: Use RAII to manage shared memory lifetime with lease files.
+// ---------- Data integrity helpers (CRC32 and shared memory header) ----------
+static uint32_t crc32_table[256];
+static bool crc32_table_initialized = false;
+static void init_crc32_table() {
+    if (crc32_table_initialized) return;
+    for (int i = 0; i < 256; ++i) {
+        uint32_t crc = i;
+        for (int j = 0; j < 8; ++j)
+            crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
+        crc32_table[i] = crc;
+    }
+    crc32_table_initialized = true;
+}
+static uint32_t crc32(const void* data, size_t len) {
+    init_crc32_table();
+    uint32_t crc = 0xFFFFFFFF;
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < len; ++i)
+        crc = (crc >> 8) ^ crc32_table[(crc ^ p[i]) & 0xFF];
+    return crc ^ 0xFFFFFFFF;
+}
+
+#define SHM_MAGIC 0xDEC0DEAD
+struct ShmHeader {
+    uint32_t magic;
+    uint32_t checksum;
+    uint32_t data_len;   // size of payload (excluding header)
+};
+static const size_t SHM_HEADER_SIZE = sizeof(ShmHeader);
+
+// ---------- RAII lease for shared memory cleanup (Linux-only, with fallback) ----------
 class SharedMemoryLease {
     std::string shm_name_;
     std::string lease_path_;
@@ -69,29 +99,40 @@ public:
     SharedMemoryLease(const std::string& shm_name)
         : shm_name_(shm_name), valid_(false)
     {
-        // On Linux, /dev/shm/ is used; we create a lease file.
+#ifdef _WIN32
+        char temp_path[MAX_PATH];
+        if (GetTempPathA(MAX_PATH, temp_path)) {
+            lease_path_ = std::string(temp_path) + shm_name_ + ".lease";
+            std::remove(lease_path_.c_str());
+            auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+            std::ofstream ofs(lease_path_);
+            if (ofs) {
+                ofs << now;
+                valid_ = true;
+            }
+        }
+#else
         lease_path_ = "/dev/shm/" + shm_name_ + ".lease";
-        // Remove stale lease if any.
         std::remove(lease_path_.c_str());
-        // Write current time (monotonic) as a string.
         auto now = std::chrono::steady_clock::now().time_since_epoch().count();
         std::ofstream ofs(lease_path_);
         if (ofs) {
             ofs << now;
             valid_ = true;
         }
+#endif
     }
     ~SharedMemoryLease() {
         if (valid_) {
-            // Remove lease file on cleanup.
             std::remove(lease_path_.c_str());
-            // Remove shared memory itself (if we are the last user).
             ipc::shared_memory_object::remove(shm_name_.c_str());
         }
     }
     bool valid() const { return valid_; }
-    // Static method to check and clean up stale shm.
     static void cleanup_stale(const std::string& shm_name) {
+#ifdef _WIN32
+        // Windows: no standard cleanup, rely on kernel cleanup when all handles closed.
+#else
         std::string lease_path = "/dev/shm/" + shm_name + ".lease";
         std::ifstream ifs(lease_path);
         if (ifs) {
@@ -99,11 +140,11 @@ public:
             ifs >> ts;
             auto now = std::chrono::steady_clock::now().time_since_epoch().count();
             if (now - ts > LEASE_TIMEOUT_SEC * 1000000000LL) {
-                // Stale, remove both.
                 std::remove(lease_path.c_str());
                 ipc::shared_memory_object::remove(shm_name.c_str());
             }
         }
+#endif
     }
 };
 
@@ -113,8 +154,6 @@ IpcClient::IpcClient() {
 
 IpcClient::~IpcClient() {
     ZIPC_LOG("~IpcClient: deterministic cleanup");
-    // FIX C1: Do not rely on ReceiverGuard; perform independent cleanup.
-    // FIX C3: No TOCTOU on active_receiver_; we directly check joinable.
     if (running_.load(std::memory_order_acquire)) {
         running_.store(false, std::memory_order_release);
         cv_.notify_all();
@@ -126,7 +165,6 @@ IpcClient::~IpcClient() {
             while (receiver_.joinable() && std::chrono::steady_clock::now() < deadline)
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             if (receiver_.joinable()) {
-                // FIX C1: force join, no detach
                 receiver_.join();
             }
         }
@@ -142,7 +180,6 @@ IpcClient::~IpcClient() {
         resp_mq_.reset();
         ipc::message_queue::remove(resp_queue_name_.c_str());
 
-        // Fail pending promises
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);
             for (auto& kv : pending_) {
@@ -163,7 +200,6 @@ IpcClient::~IpcClient() {
 }
 
 bool IpcClient::do_connect(const std::string& qname) {
-    // Atomically connect.
     if (running_.load(std::memory_order_acquire)) {
         disconnect();
     }
@@ -182,7 +218,6 @@ bool IpcClient::do_connect(const std::string& qname) {
     clear_task_queue();
     cancel_requested_.store(false, std::memory_order_release);
 
-    // Open server queue
     try {
         mq_ = std::make_unique<ipc::message_queue>(ipc::open_only, qname.c_str());
         ZIPC_LOG("connect: opened main queue '" << qname << "'");
@@ -192,7 +227,6 @@ bool IpcClient::do_connect(const std::string& qname) {
         return false;
     }
 
-    // Create private response queue
     resp_queue_name_ = generate_unique_resp_queue();
     try {
         ipc::message_queue::remove(resp_queue_name_.c_str());
@@ -206,7 +240,6 @@ bool IpcClient::do_connect(const std::string& qname) {
         return false;
     }
 
-    // Set running flags before starting threads to avoid race with destructor.
     running_.store(true, std::memory_order_release);
     worker_running_.store(true, std::memory_order_release);
 
@@ -215,15 +248,10 @@ bool IpcClient::do_connect(const std::string& qname) {
         worker_ = std::thread(&IpcClient::worker_thread_func, this);
     }
     catch (...) {
-        // Rollback
         running_.store(false, std::memory_order_release);
         worker_running_.store(false, std::memory_order_release);
-        if (receiver_.joinable()) {
-            receiver_.join();
-        }
-        if (worker_.joinable()) {
-            worker_.join();
-        }
+        if (receiver_.joinable()) receiver_.join();
+        if (worker_.joinable()) worker_.join();
         mq_.reset();
         resp_mq_.reset();
         ipc::message_queue::remove(resp_queue_name_.c_str());
@@ -254,7 +282,6 @@ void IpcClient::disconnect() {
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
 
-    // Wait for receiver thread
     if (receiver_.joinable()) {
         while (receiver_.joinable() && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -265,7 +292,6 @@ void IpcClient::disconnect() {
         }
     }
 
-    // Flush tasks and wait for worker
     clear_task_queue();
     if (worker_.joinable()) {
         while (worker_.joinable() && std::chrono::steady_clock::now() < deadline) {
@@ -277,12 +303,10 @@ void IpcClient::disconnect() {
         }
     }
 
-    // Release queue resources
     mq_.reset();
     resp_mq_.reset();
     ipc::message_queue::remove(resp_queue_name_.c_str());
 
-    // Force all pending requests to fail
     {
         std::lock_guard<std::mutex> lock(pending_mutex_);
         for (auto& kv : pending_) {
@@ -294,8 +318,6 @@ void IpcClient::disconnect() {
         }
         pending_.clear();
     }
-
-    // Clear notify handlers
     {
         std::lock_guard<std::mutex> lock(notify_mutex_);
         binary_notify_handlers_.clear();
@@ -307,15 +329,12 @@ void IpcClient::disconnect() {
 void IpcClient::cancel() {
     ZIPC_LOG("cancel: cancelling all pending RPCs");
     cancel_requested_.store(true, std::memory_order_release);
-    cv_.notify_all();  // wake up any waiting threads
-    // Pending promises will be failed when they time out or are explicitly woken.
-    // We also need to wake up the receiver thread if it's waiting on cv_.
+    cv_.notify_all();
 }
 
-// ---------- call_binary with cancellation ----------
+// ---------- call_binary with non-blocking send and integrity header ----------
 int IpcClient::call_binary(const std::string& func, const void* data, size_t size,
     void** out_data, size_t* out_size) {
-    // FIX C6: Use shared_future to avoid blocking destructor issues.
     if (tls_in_callback_) {
         ZIPC_LOG("call_binary: recursion detected");
         return IPC_ERR_RECURSION;
@@ -334,12 +353,10 @@ int IpcClient::call_binary(const std::string& func, const void* data, size_t siz
         return IPC_ERR_SIZE;
     }
 
-    // Check cancellation flag early
     if (cancel_requested_.load(std::memory_order_acquire)) {
         return IPC_ERR_CANCELED;
     }
 
-    // Atomically allocate req_id and insert promise
     uint64_t req_id;
     std::shared_ptr<std::promise<Response>> promise;
     {
@@ -352,22 +369,32 @@ int IpcClient::call_binary(const std::string& func, const void* data, size_t siz
     std::string shm_name;
     if (size == 0) {
         shm_name = ZERO_SHM_MARKER;
-        ZIPC_LOG("call_binary: zero-size data, using marker");
     }
     else {
         shm_name = generate_unique_shm_name();
-        // Clean up stale leases
         SharedMemoryLease::cleanup_stale(shm_name);
         ipc::shared_memory_object::remove(shm_name.c_str());
         try {
+            size_t total_size = SHM_HEADER_SIZE + size;
             ipc::shared_memory_object shm(ipc::create_only, shm_name.c_str(), ipc::read_write);
-            shm.truncate(size);
+            shm.truncate(total_size);
             ipc::mapped_region region(shm, ipc::read_write);
-            if (data && size > 0) {
-                std::memcpy(region.get_address(), data, size);
+
+            // Write header and payload with checksum
+            ShmHeader header;
+            header.magic = SHM_MAGIC;
+            header.data_len = static_cast<uint32_t>(size);
+            if (size > 0 && data) {
+                void* payload = static_cast<char*>(region.get_address()) + SHM_HEADER_SIZE;
+                std::memcpy(payload, data, size);
+                header.checksum = crc32(data, size);
             }
-            ZIPC_LOG("call_binary: created shared memory '" << shm_name << "', size=" << size);
-            // We do not keep a lease here; we rely on client to remove after reading.
+            else {
+                header.checksum = 0;
+            }
+            std::memcpy(region.get_address(), &header, SHM_HEADER_SIZE);
+            ZIPC_LOG("call_binary: created shared memory '" << shm_name
+                << "', total_size=" << total_size << ", payload=" << size);
         }
         catch (const std::exception& e) {
             ZIPC_LOG("call_binary: failed to create shared memory: " << e.what());
@@ -390,7 +417,14 @@ int IpcClient::call_binary(const std::string& func, const void* data, size_t siz
     }
 
     try {
-        mq_->send(msg.c_str(), msg.size(), 0);
+        if (!mq_->try_send(msg.c_str(), msg.size(), 0)) {
+            ZIPC_LOG("call_binary: main queue full, cannot send");
+            if (shm_name != ZERO_SHM_MARKER)
+                ipc::shared_memory_object::remove(shm_name.c_str());
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            pending_.erase(req_id);
+            return IPC_ERR_BUSY;
+        }
         ZIPC_LOG("call_binary: sent request req_id=" << req_id);
     }
     catch (const ipc::interprocess_exception& e) {
@@ -402,10 +436,8 @@ int IpcClient::call_binary(const std::string& func, const void* data, size_t siz
         return IPC_ERR_SEND;
     }
 
-    // Use shared_future for safer lifetime management (C6)
     auto future = promise->get_future().share();
 
-    // Wait with timeout and cancellation check
     const auto start = std::chrono::steady_clock::now();
     const auto timeout = timeout_;
     std::future_status status = std::future_status::timeout;
@@ -417,7 +449,7 @@ int IpcClient::call_binary(const std::string& func, const void* data, size_t siz
             break;
         }
         if (cancel_requested_.load(std::memory_order_acquire)) {
-            status = std::future_status::deferred;  // treat as cancelled
+            status = std::future_status::deferred;
             break;
         }
         status = future.wait_for(remaining);
@@ -470,9 +502,8 @@ int IpcClient::call_binary(const std::string& func, const void* data, size_t siz
     return IPC_OK;
 }
 
-// ---------- notify_binary with proper cleanup (C4) ----------
+// ---------- notify_binary with non-blocking send and integrity header ----------
 int IpcClient::notify_binary(const std::string& func, const void* data, size_t size) {
-    // Recursion guard
     if (tls_in_callback_) {
         ZIPC_LOG("notify_binary: recursion detected");
         return IPC_ERR_RECURSION;
@@ -502,21 +533,31 @@ int IpcClient::notify_binary(const std::string& func, const void* data, size_t s
     std::string shm_name;
     if (size == 0) {
         shm_name = ZERO_SHM_MARKER;
-        ZIPC_LOG("notify_binary: zero-size data, using marker");
     }
     else {
         shm_name = generate_unique_shm_name();
-        // Clean up stale leases
         SharedMemoryLease::cleanup_stale(shm_name);
         ipc::shared_memory_object::remove(shm_name.c_str());
         try {
+            size_t total_size = SHM_HEADER_SIZE + size;
             ipc::shared_memory_object shm(ipc::create_only, shm_name.c_str(), ipc::read_write);
-            shm.truncate(size);
+            shm.truncate(total_size);
             ipc::mapped_region region(shm, ipc::read_write);
-            if (data && size > 0) {
-                std::memcpy(region.get_address(), data, size);
+
+            ShmHeader header;
+            header.magic = SHM_MAGIC;
+            header.data_len = static_cast<uint32_t>(size);
+            if (size > 0 && data) {
+                void* payload = static_cast<char*>(region.get_address()) + SHM_HEADER_SIZE;
+                std::memcpy(payload, data, size);
+                header.checksum = crc32(data, size);
             }
-            ZIPC_LOG("notify_binary: created shared memory '" << shm_name << "', size=" << size);
+            else {
+                header.checksum = 0;
+            }
+            std::memcpy(region.get_address(), &header, SHM_HEADER_SIZE);
+            ZIPC_LOG("notify_binary: created shared memory '" << shm_name
+                << "', total_size=" << total_size << ", payload=" << size);
         }
         catch (const std::exception& e) {
             ZIPC_LOG("notify_binary: failed to create shared memory: " << e.what());
@@ -528,14 +569,18 @@ int IpcClient::notify_binary(const std::string& func, const void* data, size_t s
     std::string msg = "NOTIFY|BIN|" + func + "|" + shm_name;
     if (msg.size() > 1024) {
         ZIPC_LOG("notify_binary: message size " << msg.size() << " exceeds 1024");
-        // FIX C4: ensure shm is removed even if message size is too large
         if (shm_name != ZERO_SHM_MARKER)
             ipc::shared_memory_object::remove(shm_name.c_str());
         return IPC_ERR_SIZE;
     }
 
     try {
-        mq_->send(msg.c_str(), msg.size(), 0);
+        if (!mq_->try_send(msg.c_str(), msg.size(), 0)) {
+            ZIPC_LOG("notify_binary: main queue full, cannot send");
+            if (shm_name != ZERO_SHM_MARKER)
+                ipc::shared_memory_object::remove(shm_name.c_str());
+            return IPC_ERR_BUSY;
+        }
         ZIPC_LOG("notify_binary: sent, func='" << func << "', shm='" << shm_name << "', size=" << size);
     }
     catch (const ipc::interprocess_exception& e) {
@@ -544,11 +589,10 @@ int IpcClient::notify_binary(const std::string& func, const void* data, size_t s
             ipc::shared_memory_object::remove(shm_name.c_str());
         return IPC_ERR_SEND;
     }
-    // shm will be removed by the server's receiver after reading, or by the lease mechanism.
     return IPC_OK;
 }
 
-// ---------- receiver_thread_func ----------
+// ---------- receiver_thread_func with integrity verification ----------
 void IpcClient::receiver_thread_func(std::shared_ptr<ipc::message_queue> resp_mq) {
     char buffer[1024];
     ZIPC_LOG("receiver_thread: started, tid=" << std::this_thread::get_id());
@@ -558,7 +602,6 @@ void IpcClient::receiver_thread_func(std::shared_ptr<ipc::message_queue> resp_mq
         unsigned priority;
         bool ok = receive_with_intr(resp_mq, buffer, sizeof(buffer), recvd, priority);
         if (!ok) {
-            // FIX C5: Use cv wait with timeout to avoid busy-loop and handle EINTR properly.
             std::unique_lock<std::mutex> lock(cv_mutex_);
             cv_.wait_for(lock, std::chrono::milliseconds(10),
                 [this] { return !running_.load(std::memory_order_acquire); });
@@ -574,7 +617,6 @@ void IpcClient::receiver_thread_func(std::shared_ptr<ipc::message_queue> resp_mq
         std::string type = msg.substr(0, first_pipe);
 
         if (type == "RSP") {
-            // Format: RSP|req_id|status|BIN|shm_name
             size_t pos1 = first_pipe;
             size_t pos2 = msg.find('|', pos1 + 1);
             if (pos2 == std::string::npos) continue;
@@ -615,21 +657,52 @@ void IpcClient::receiver_thread_func(std::shared_ptr<ipc::message_queue> resp_mq
                     try {
                         ipc::shared_memory_object shm(ipc::open_only, shm_name.c_str(), ipc::read_only);
                         ipc::mapped_region region(shm, ipc::read_only);
-                        size_t sz = region.get_size();
-                        buf = ipc_alloc(sz);
-                        if (buf) {
-                            std::memcpy(buf, region.get_address(), sz);
-                            resp.bin_data = buf;
-                            resp.bin_size = sz;
-                            ZIPC_LOG("receiver_thread: binary response size=" << sz);
-                            ZIPC_LOG_MD5("receiver_thread binary response", buf, sz);
+                        size_t region_size = region.get_size();
+                        if (region_size < SHM_HEADER_SIZE) {
+                            ZIPC_LOG("receiver_thread: response shm too small");
+                            ipc::shared_memory_object::remove(shm_name.c_str());
+                            resp.status = IPC_ERR_RECEIVE;
                         }
                         else {
-                            resp.status = IPC_ERR_MEMORY;
-                            ZIPC_LOG("receiver_thread: ipc_alloc failed");
+                            const ShmHeader* hdr = static_cast<const ShmHeader*>(region.get_address());
+                            if (hdr->magic != SHM_MAGIC) {
+                                ZIPC_LOG("receiver_thread: bad magic in response");
+                                ipc::shared_memory_object::remove(shm_name.c_str());
+                                resp.status = IPC_ERR_RECEIVE;
+                            }
+                            else {
+                                size_t payload_len = hdr->data_len;
+                                if (region_size != SHM_HEADER_SIZE + payload_len) {
+                                    ZIPC_LOG("receiver_thread: size mismatch in response");
+                                    ipc::shared_memory_object::remove(shm_name.c_str());
+                                    resp.status = IPC_ERR_RECEIVE;
+                                }
+                                else {
+                                    const void* payload = static_cast<const char*>(region.get_address()) + SHM_HEADER_SIZE;
+                                    uint32_t calc = crc32(payload, payload_len);
+                                    if (calc != hdr->checksum) {
+                                        ZIPC_LOG("receiver_thread: checksum mismatch in response");
+                                        ipc::shared_memory_object::remove(shm_name.c_str());
+                                        resp.status = IPC_ERR_RECEIVE;
+                                    }
+                                    else {
+                                        buf = ipc_alloc(payload_len);
+                                        if (buf) {
+                                            std::memcpy(buf, payload, payload_len);
+                                            resp.bin_data = buf;
+                                            resp.bin_size = payload_len;
+                                            ZIPC_LOG("receiver_thread: binary response size=" << payload_len);
+                                            ZIPC_LOG_MD5("receiver_thread binary response", buf, payload_len);
+                                        }
+                                        else {
+                                            resp.status = IPC_ERR_MEMORY;
+                                            ZIPC_LOG("receiver_thread: ipc_alloc failed");
+                                        }
+                                        ipc::shared_memory_object::remove(shm_name.c_str());
+                                    }
+                                }
+                            }
                         }
-                        // FIX S2: remove shm after region destructs; region already destroyed here.
-                        ipc::shared_memory_object::remove(shm_name.c_str());
                     }
                     catch (const std::exception& e) {
                         ZIPC_LOG("receiver_thread: failed to open binary response shm: " << e.what());
@@ -669,7 +742,6 @@ void IpcClient::receiver_thread_func(std::shared_ptr<ipc::message_queue> resp_mq
             }
         }
         else if (type == "NOTIFY") {
-            // NOTIFY|BIN|func|shm_name
             size_t pos1 = first_pipe;
             size_t pos2 = msg.find('|', pos1 + 1);
             if (pos2 == std::string::npos) continue;
@@ -717,14 +789,37 @@ void IpcClient::receiver_thread_func(std::shared_ptr<ipc::message_queue> resp_mq
                     try {
                         ipc::shared_memory_object shm(ipc::open_only, shm_name.c_str(), ipc::read_only);
                         ipc::mapped_region region(shm, ipc::read_only);
-                        size_t sz = region.get_size();
-                        void* copy = ipc_alloc(sz);
-                        if (copy) {
-                            std::memcpy(copy, region.get_address(), sz);
-                            // FIX S2: remove shm after copying
+                        size_t region_size = region.get_size();
+                        if (region_size < SHM_HEADER_SIZE) {
+                            ZIPC_LOG("receiver_thread: notify shm too small");
                             ipc::shared_memory_object::remove(shm_name.c_str());
-                            ZIPC_LOG("receiver_thread: copied notify data size=" << sz);
-                            auto task = [this, func, copy, sz]() {
+                            continue;
+                        }
+                        const ShmHeader* hdr = static_cast<const ShmHeader*>(region.get_address());
+                        if (hdr->magic != SHM_MAGIC) {
+                            ZIPC_LOG("receiver_thread: bad magic in notify");
+                            ipc::shared_memory_object::remove(shm_name.c_str());
+                            continue;
+                        }
+                        size_t payload_len = hdr->data_len;
+                        if (region_size != SHM_HEADER_SIZE + payload_len) {
+                            ZIPC_LOG("receiver_thread: size mismatch in notify");
+                            ipc::shared_memory_object::remove(shm_name.c_str());
+                            continue;
+                        }
+                        const void* payload = static_cast<const char*>(region.get_address()) + SHM_HEADER_SIZE;
+                        uint32_t calc = crc32(payload, payload_len);
+                        if (calc != hdr->checksum) {
+                            ZIPC_LOG("receiver_thread: checksum mismatch in notify");
+                            ipc::shared_memory_object::remove(shm_name.c_str());
+                            continue;
+                        }
+                        void* copy = ipc_alloc(payload_len);
+                        if (copy) {
+                            std::memcpy(copy, payload, payload_len);
+                            ipc::shared_memory_object::remove(shm_name.c_str());
+                            ZIPC_LOG("receiver_thread: copied notify data size=" << payload_len);
+                            auto task = [this, func, copy, payload_len]() {
                                 ipc_binary_notify_handler h = nullptr;
                                 void* trigger = nullptr;
                                 {
@@ -742,8 +837,8 @@ void IpcClient::receiver_thread_func(std::shared_ptr<ipc::message_queue> resp_mq
                                 if (h) {
                                     tls_in_callback_ = true;
                                     try {
-                                        h(trigger, copy, sz);
-                                        ZIPC_LOG("worker_task: notify handler executed, size=" << sz);
+                                        h(trigger, copy, payload_len);
+                                        ZIPC_LOG("worker_task: notify handler executed, size=" << payload_len);
                                     }
                                     catch (...) {
                                         ZIPC_LOG("worker_task: notify handler threw exception");
@@ -777,13 +872,11 @@ void IpcClient::receiver_thread_func(std::shared_ptr<ipc::message_queue> resp_mq
     ZIPC_LOG("receiver_thread: exiting");
 }
 
-// ---------- worker_thread_func ----------
 void IpcClient::worker_thread_func() {
     struct WorkerGuard {
         IpcClient* client;
         ~WorkerGuard() {
             if (client) {
-                // no active_worker_ anymore, we just let thread exit
                 ZIPC_LOG("worker_thread: exiting");
             }
         }
@@ -817,7 +910,6 @@ void IpcClient::worker_thread_func() {
     ZIPC_LOG("worker_thread: exiting");
 }
 
-// ---------- enqueue_task ----------
 void IpcClient::enqueue_task(std::function<void()> task) {
     if (!worker_running_.load(std::memory_order_acquire)) {
         ZIPC_LOG("enqueue_task: worker not running, discarding task");
@@ -828,7 +920,6 @@ void IpcClient::enqueue_task(std::function<void()> task) {
     task_cv_.notify_one();
 }
 
-// ---------- clear_task_queue ----------
 void IpcClient::clear_task_queue() {
     std::lock_guard<std::mutex> lock(task_mutex_);
     std::queue< std::function<void()> > empty;
@@ -836,13 +927,11 @@ void IpcClient::clear_task_queue() {
     ZIPC_LOG("clear_task_queue: discarded all pending tasks");
 }
 
-// ---------- receive_with_intr (EINTR-safe with running_ check) ----------
 bool IpcClient::receive_with_intr(std::shared_ptr<ipc::message_queue> mq,
     char* buffer, size_t bufsize,
     size_t& recvd, unsigned& priority) {
     const int max_retries = 5;
     for (int attempt = 0; attempt < max_retries; ++attempt) {
-        // Check running_ flag to avoid spinning after shutdown
         if (!running_.load(std::memory_order_acquire)) {
             return false;
         }
@@ -869,7 +958,6 @@ bool IpcClient::receive_with_intr(std::shared_ptr<ipc::message_queue> mq,
     return false;
 }
 
-// ---------- generate_unique_shm_name ----------
 std::string IpcClient::generate_unique_shm_name() {
     static std::atomic<uint64_t> counter{ 0 };
 #ifdef _WIN32
@@ -901,7 +989,6 @@ std::string IpcClient::generate_unique_shm_name() {
     return name;
 }
 
-// ---------- generate_unique_resp_queue ----------
 std::string IpcClient::generate_unique_resp_queue() {
     static std::atomic<uint64_t> counter{ 0 };
 #ifdef _WIN32
@@ -916,7 +1003,6 @@ std::string IpcClient::generate_unique_resp_queue() {
     return ss.str();
 }
 
-// ---------- is_connected ----------
 bool IpcClient::is_connected() const {
     if (!mq_) return false;
     try {
@@ -928,7 +1014,6 @@ bool IpcClient::is_connected() const {
     }
 }
 
-// ---------- register_binary_notify ----------
 int IpcClient::register_binary_notify(const std::string& name,
     ipc_binary_notify_handler h, void* trigger) {
     std::lock_guard<std::mutex> lock(notify_mutex_);
@@ -941,7 +1026,6 @@ int IpcClient::register_binary_notify(const std::string& name,
     return IPC_OK;
 }
 
-// ---------- unregister_binary_notify ----------
 int IpcClient::unregister_binary_notify(const std::string& name) {
     std::lock_guard<std::mutex> lock(notify_mutex_);
     auto it = binary_notify_handlers_.find(name);
