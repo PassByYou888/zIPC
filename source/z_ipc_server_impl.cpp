@@ -1,6 +1,11 @@
 /**
  * @file z_ipc_server_impl.cpp
  * @brief Server implementation ¨C hardened with exception safety, non-blocking sends, and data integrity checks.
+ *
+ * Fix history (2026-08-26):
+ *  - CRC32 table initialization changed to std::once_flag for thread safety.
+ *  - stop() now uses detach after timeout to prevent blocking.
+ *  - All comments converted to English.
  */
 
 #include "z_ipc_server_impl.h"
@@ -13,6 +18,7 @@
 #include <algorithm>
 #include <fstream>
 #include <cctype>
+#include <mutex>          // for std::once_flag
 
 #ifdef _WIN32
 #include <windows.h>
@@ -53,21 +59,21 @@ static std::string hex_dump(const void* data, size_t size, size_t max_len = 32) 
 static const std::string ZERO_SHM_MARKER = "__ZERO__";
 static const int WORKER_TIMEOUT_SEC = 5;
 
-// ---------- Data integrity helpers (CRC32 and shared memory header) ----------
+// ---------- Data integrity helpers (CRC32) ----------
 static uint32_t crc32_table[256];
-static bool crc32_table_initialized = false;
+static std::once_flag crc32_once_flag;            // thread-safe initialization flag
+
 static void init_crc32_table() {
-    if (crc32_table_initialized) return;
     for (int i = 0; i < 256; ++i) {
         uint32_t crc = i;
         for (int j = 0; j < 8; ++j)
             crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
         crc32_table[i] = crc;
     }
-    crc32_table_initialized = true;
 }
+
 static uint32_t crc32(const void* data, size_t len) {
-    init_crc32_table();
+    std::call_once(crc32_once_flag, init_crc32_table);
     uint32_t crc = 0xFFFFFFFF;
     const uint8_t* p = static_cast<const uint8_t*>(data);
     for (size_t i = 0; i < len; ++i)
