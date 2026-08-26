@@ -1,6 +1,11 @@
 /**
  * @file z_ipc_client_impl.cpp
  * @brief Client implementation ¨C hardened with non-blocking sends, exception safety, and data integrity checks.
+ *
+ * Fix history (2026-08-26):
+ *  - CRC32 table initialization changed to std::once_flag for thread safety.
+ *  - SharedMemoryLease on Linux now supports /dev/shm and falls back to /tmp.
+ *  - Destructor/disconnect timeout now uses detach to prevent blocking.
  */
 
 #include "z_ipc_client_impl.h"
@@ -16,6 +21,7 @@
 #include <errno.h>
 #include <system_error>
 #include <fstream>
+#include <mutex>          // for std::once_flag
 
 #ifdef _WIN32
 #include <windows.h>
@@ -60,21 +66,21 @@ static const int LEASE_TIMEOUT_SEC = 30;  // seconds
 
 thread_local bool IpcClient::tls_in_callback_ = false;
 
-// ---------- Data integrity helpers (CRC32 and shared memory header) ----------
+// ---------- Data integrity helpers (CRC32) ----------
 static uint32_t crc32_table[256];
-static bool crc32_table_initialized = false;
+static std::once_flag crc32_once_flag;            // thread-safe initialization flag
+
 static void init_crc32_table() {
-    if (crc32_table_initialized) return;
     for (int i = 0; i < 256; ++i) {
         uint32_t crc = i;
         for (int j = 0; j < 8; ++j)
             crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
         crc32_table[i] = crc;
     }
-    crc32_table_initialized = true;
 }
+
 static uint32_t crc32(const void* data, size_t len) {
-    init_crc32_table();
+    std::call_once(crc32_once_flag, init_crc32_table);   // guarantee single initialization
     uint32_t crc = 0xFFFFFFFF;
     const uint8_t* p = static_cast<const uint8_t*>(data);
     for (size_t i = 0; i < len; ++i)
@@ -90,7 +96,7 @@ struct ShmHeader {
 };
 static const size_t SHM_HEADER_SIZE = sizeof(ShmHeader);
 
-// ---------- RAII lease for shared memory cleanup (Linux-only, with fallback) ----------
+// ---------- RAII lease for shared memory cleanup ----------
 class SharedMemoryLease {
     std::string shm_name_;
     std::string lease_path_;
@@ -112,13 +118,23 @@ public:
             }
         }
 #else
-        lease_path_ = "/dev/shm/" + shm_name_ + ".lease";
+        // Linux: try /dev/shm first, fallback to /tmp if not writable
+        std::string base_dir = "/dev/shm";
+        if (access(base_dir.c_str(), W_OK) != 0) {
+            ZIPC_LOG("SharedMemoryLease: /dev/shm not writable, falling back to /tmp");
+            base_dir = "/tmp";
+        }
+        lease_path_ = base_dir + "/" + shm_name_ + ".lease";
         std::remove(lease_path_.c_str());
         auto now = std::chrono::steady_clock::now().time_since_epoch().count();
         std::ofstream ofs(lease_path_);
         if (ofs) {
             ofs << now;
             valid_ = true;
+            ZIPC_LOG("SharedMemoryLease: created lease at " << lease_path_);
+        }
+        else {
+            ZIPC_LOG("SharedMemoryLease: failed to create lease at " << lease_path_);
         }
 #endif
     }
@@ -126,6 +142,7 @@ public:
         if (valid_) {
             std::remove(lease_path_.c_str());
             ipc::shared_memory_object::remove(shm_name_.c_str());
+            ZIPC_LOG("SharedMemoryLease: removed lease and shm " << shm_name_);
         }
     }
     bool valid() const { return valid_; }
@@ -133,15 +150,21 @@ public:
 #ifdef _WIN32
         // Windows: no standard cleanup, rely on kernel cleanup when all handles closed.
 #else
-        std::string lease_path = "/dev/shm/" + shm_name + ".lease";
-        std::ifstream ifs(lease_path);
-        if (ifs) {
-            int64_t ts;
-            ifs >> ts;
-            auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-            if (now - ts > LEASE_TIMEOUT_SEC * 1000000000LL) {
-                std::remove(lease_path.c_str());
-                ipc::shared_memory_object::remove(shm_name.c_str());
+        // try both possible directories
+        std::vector<std::string> candidates = { "/dev/shm", "/tmp" };
+        for (const auto& base : candidates) {
+            std::string lease_path = base + "/" + shm_name + ".lease";
+            std::ifstream ifs(lease_path);
+            if (ifs) {
+                int64_t ts;
+                ifs >> ts;
+                auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+                if (now - ts > LEASE_TIMEOUT_SEC * 1000000000LL) {
+                    std::remove(lease_path.c_str());
+                    ipc::shared_memory_object::remove(shm_name.c_str());
+                    ZIPC_LOG("cleanup_stale: removed stale lease and shm " << shm_name);
+                }
+                break; // found a lease, stop searching
             }
         }
 #endif
@@ -165,14 +188,16 @@ IpcClient::~IpcClient() {
             while (receiver_.joinable() && std::chrono::steady_clock::now() < deadline)
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             if (receiver_.joinable()) {
-                receiver_.join();
+                ZIPC_LOG("~IpcClient: receiver join timeout, detaching");
+                receiver_.detach();
             }
         }
         if (worker_.joinable()) {
             while (worker_.joinable() && std::chrono::steady_clock::now() < deadline)
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             if (worker_.joinable()) {
-                worker_.join();
+                ZIPC_LOG("~IpcClient: worker join timeout, detaching");
+                worker_.detach();
             }
         }
 
@@ -287,8 +312,8 @@ void IpcClient::disconnect() {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         if (receiver_.joinable()) {
-            ZIPC_LOG("disconnect: receiver join timeout, forcing join");
-            receiver_.join();
+            ZIPC_LOG("disconnect: receiver join timeout, detaching");
+            receiver_.detach();
         }
     }
 
@@ -298,8 +323,8 @@ void IpcClient::disconnect() {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         if (worker_.joinable()) {
-            ZIPC_LOG("disconnect: worker join timeout, forcing join");
-            worker_.join();
+            ZIPC_LOG("disconnect: worker join timeout, detaching");
+            worker_.detach();
         }
     }
 
