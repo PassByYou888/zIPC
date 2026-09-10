@@ -1,0 +1,91 @@
+# zIPC
+
+> zIPC is a cross-platform, high-performance inter-process communication (IPC) library for same-machine communication. It uses shared memory for zero-copy bulk data transfer and message queues for control signaling, exposing a pure C ABI that any FFI-capable language can call. Typical same-machine latency is < 1 ms. zIPC is the IPC engine used in production by LingoFuse, with 18+ months of production use and peak daily calls over 50 million.
+>
+> zIPC 是一个基于共享内存 + 消息队列的跨平台同机 IPC 库，提供纯 C ABI，支持 C++、Python、Go、Rust、Java、C#、Pascal 等语言，同机延迟 < 1ms。已被 LingoFuse 生产验证 18+ 个月，日调用峰值 5000 万+。
+
+## Key facts
+- Repository: https://github.com/PassByYou888/zIPC
+- Version: v1.2.0 (2026-08-26)
+- Status: Production-ready
+- Platforms: Windows, Linux, macOS, BSD
+- Interface: Pure C ABI (`z_ipc_api.h`)
+- Core mechanism: Shared memory + message queue
+- Latency: < 1 ms for same-machine IPC
+- Throughput: 10,000+ calls/s (per README)
+- Production proof: Used by LingoFuse for 18+ months, peak > 50 million calls/day
+- Related project: LingoFuse — https://github.com/PassByYou888/LingoFuse
+
+## Core capabilities
+- Zero-copy shared memory transport
+- Zero serialization for bulk data
+- CRC32 data integrity check and magic-number validation
+- Lease-based automatic cleanup of stale shared memory
+- Non-blocking send via `try_send()` and `IPC_ERR_BUSY`
+- Client RPC timeout and cancellation
+- Server worker health monitoring
+- Cross-platform CMake build
+- Language bindings via C ABI / FFI: C, C++, Python, Go, Rust, Java, C#, Pascal, etc.
+
+## Quick start
+
+### C++ server
+```cpp
+#include "z_ipc_api.h"
+
+static void AddHandler(void* trigger, const void* data, size_t size,
+                       void** out, size_t* out_size) {
+    int a = *(int*)data;
+    int b = *(int*)((char*)data + 4);
+    int sum = a + b;
+    *out = ipc_alloc(sizeof(int));
+    *(int*)*out = sum;
+    *out_size = sizeof(int);
+}
+
+int main() {
+    ipc_server_handle_t svr = ipc_server_create("calc_service", 4);
+    ipc_server_register_binary_reply(svr, "add", AddHandler, nullptr);
+    while(1) sleep(1);
+}
+```
+
+### Python client
+```python
+from lingofuse import C4
+client = C4("CalcService", "ipc:calc_service")
+result = client.add(10, 20)  # 30, latency < 1ms
+```
+
+### Go client
+```go
+client, _ := lingofuse.NewClient()
+client.PrepareClient("ipc:calc_service")
+result, _ := client.Call("CalcService", param, 3000)
+```
+
+### Build
+```bash
+mkdir build && cd build
+cmake .. -DZIPC_BUILD_SHARED=ON -DZIPC_ENABLE_LOGGING=OFF
+make -j$(nproc)
+```
+
+## When to use zIPC
+- Same-machine, multi-language process communication
+- AI inference services with Python/C++/Go components
+- Game servers with mixed C++/C#/Python services
+- Industrial automation / PLC upper-computer communication
+- Microservice sidecars
+- Plugin systems where plugins may be written in different languages
+
+## Relation to LingoFuse
+zIPC is the same-machine IPC engine under LingoFuse. Use zIPC directly if you only need same-machine IPC. Use LingoFuse if you need cross-language RPC, service discovery, load balancing, and agent communication.
+
+## Links
+- [zIPC GitHub Repository](https://github.com/PassByYou888/zIPC): Main repository
+- [LingoFuse](https://github.com/PassByYou888/LingoFuse): Related cross-language RPC project
+- README: https://github.com/PassByYou888/zIPC#readme
+
+## Keywords
+zIPC, IPC, inter-process communication, shared memory, message queue, C ABI, FFI, cross-language, zero-copy, low-latency, LingoFuse, 进程间通信, 共享内存, 消息队列, 跨语言, 零拷贝, 同机通信
